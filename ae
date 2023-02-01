@@ -1,0 +1,171 @@
+name: Container on Kubernetes
+
+on:
+  workflow_call:
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    #if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' || github.ref == 'refs/heads') || github.event_name == 'pull_request'
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v2.4.2
+        
+      - name: Setup NuGet.exe for use with actions
+        uses: NuGet/setup-nuget@v1.0.7
+        with:
+          nuget-version: 6.3.0
+
+      - name: Setup .NET Core SDK
+        uses: actions/setup-dotnet@v2.1.0
+        with:
+          dotnet-version: |
+            3.1.x
+            6.x
+          source-url: https://pkgs.dev.azure.com/mottu-ops/_packaging/mottu-ops/nuget/v3/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.ARTFACT_NUGET_SECRET }}    
+
+      - name: test
+        run: make test_application
+
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    #if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' ) || github.event_name == 'pull_request'
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v2.4.2
+
+      - name: Auth Google Clould Plataform
+        uses: google-github-actions/auth@v0
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v0
+
+      - name: Setup docker
+        run: gcloud auth configure-docker -q
+
+      - name: Setup NuGet.exe for use with actions
+        uses: NuGet/setup-nuget@v1.0.7
+        with:
+          nuget-version: 6.3.0
+
+      - name: Setup .NET Core SDK
+        uses: actions/setup-dotnet@v2.1.0
+        with:
+          dotnet-version: |
+            3.1.x
+            6.x
+          source-url: https://pkgs.dev.azure.com/mottu-ops/_packaging/mottu-ops/nuget/v3/index.json
+        env:
+          NUGET_AUTH_TOKEN: ${{ secrets.ARTFACT_NUGET_SECRET }}    
+
+          
+      - name: build application
+        run: make build_application
+
+      - run: |
+          TEMPORARY_CONTAINER_NAME=${{github.sha}}
+          docker build \
+            -t $TEMPORARY_CONTAINER_NAME \
+            --label github.repository=${{github.repository}} \
+            --label github.repositoryUrl=${{github.repositoryUrl}} \
+            --label github.sha="${{github.sha}}" \
+            --label github.ref="${{github.ref}}" \
+            --label github.event.sender.login="${{github.event.sender.login}}" \
+            --label github.event.sender.url="${{github.event.sender.url}}" \
+            .
+
+    #- name: SonarQube Scan
+    #  uses: kitabisa/sonarqube-action@v1.2.0
+    #  with:
+    #    host: ${{ secrets.SONARQUBE_HOST }}
+    #    login: ${{ secrets.SONARQUBE_TOKEN }}
+    #    projectBaseDir: "src/"
+    #    projectKey: $TEMPORARY_CONTAINER_NAME
+
+
+        name: 'build container'
+
+      - run: |   
+          TEMPORARY_CONTAINER_NAME=$(node -p "require('./.github/config.json').container_names.temporary"):${{github.sha}}
+          docker tag ${{github.sha}} $TEMPORARY_CONTAINER_NAME
+          docker push $TEMPORARY_CONTAINER_NAME
+        name: "push container"      
+  
+  deployHomologation:
+    name: homologation (apollo)
+    environment: homologation
+    #if: (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop' ) || github.event_name == 'pull_request'
+    needs: 
+      - build
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.2
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v3.4.1
+
+      - name: Auth Google Clould Plataform
+        uses: google-github-actions/auth@v0
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v0
+
+      - name: Setup docker
+        run: gcloud auth configure-docker -q
+
+      - run: |
+          NORMALIZED_BRANCH_NAME=$(sed -E 's/[^[:alnum:][:space:]]+/-/g' <<<"${{github.ref_name}}" | tr '[:upper:]' '[:lower:]')
+          TEMPORARY_CONTAINER_NAME=$(node -p "require('./.github/config.json').container_names.temporary"):${{github.sha}}
+          CONTAINER_NAME=$(node -p "require('./.github/config.json').container_names.apollo")
+          echo "$CONTAINER_NAME"
+          yes | gcloud -q container images add-tag $TEMPORARY_CONTAINER_NAME $CONTAINER_NAME:$NORMALIZED_BRANCH_NAME-${{github.sha}} 
+        name: tag container
+
+  deployProduction:
+    timeout-minutes: 10
+    name: production (zeus)
+    environment: production
+    if: always() && (startsWith(github.ref, 'refs/tags/v') && github.event_name != 'pull_request')
+    needs: 
+      - build
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2.4.2
+
+      - name: Setup Node.js environment
+        uses: actions/setup-node@v3.4.1
+
+      - name: Auth Google Clould Plataform
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+
+      - name: Setup docker
+        run: gcloud auth configure-docker -q
+      
+        timeout-minutes: 10
+      - run: |
+          NORMALIZED_BRANCH_NAME=$(sed -E 's/[^[:alnum:][:space:]]+/-/g' <<<"${{github.ref_name}}" | tr '[:upper:]' '[:lower:]')
+          TEMPORARY_CONTAINER_NAME=$(node -p "require('./.github/config.json').container_names.temporary"):${{github.sha}}
+          CONTAINER_NAME=$(node -p "require('./.github/config.json').container_names.zeus")
+          echo "$CONTAINER_NAME"
+          gcloud -q container images add-tag $TEMPORARY_CONTAINER_NAME $CONTAINER_NAME:$NORMALIZED_BRANCH_NAME-${{github.sha}} 
+        name: tag container
